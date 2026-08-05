@@ -1,112 +1,149 @@
-name: Build Armbian PREEMPT_RT para Orange Pi Zero
+name: Build verified Orange Pi Zero PREEMPT_RT image
 
 on:
-  push:
-    branches: ["main"]
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-armbian-rt.yml"
+      - "userpatches/**"
+
+permissions:
+  contents: read
 
 env:
-  KERNEL_VERSION: "6.6.147"
-  RT_PATCH: "rt77"
-  RT_URL: "https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.6/patch-6.6.147-rt77.patch.xz"
+  ARMBIAN_COMMIT: 43d7f8a43d8525aa3983c9d675a96dd2f99798f2
+  KERNEL_VERSION: 6.18.37
+  RT_RELEASE: rt6
 
 jobs:
-  build-rt-image:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 420
+  build-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install host dependencies
-        run: sudo apt-get update && sudo apt-get install -y git wget acl xz-utils curl
-
-      - name: Clone Armbian Build Framework
-        run: git clone --depth=1 https://github.com/armbian/build
-
-      - name: Patch build framework for RT version strings
+      - name: Install build and verification dependencies
         run: |
-          cd build
-          # Handle RT suffix in kernel version (e.g. 6.6.147-rt77-current-sunxi)
-          sed -i 's/${kernel_version}-${BRANCH}/${kernel_version}-rt${RT_PATCH_VER}-${BRANCH}/g' \
-            lib/functions/compilation/kernel-debs.sh || true
-          # Also handle kernel_version_family
-          sed -i 's/declare kernel_version_family="${kernel_version}-${BRANCH}/declare kernel_version_family="${kernel_version}-rt${RT_PATCH_VER}-${BRANCH}/' \
-            lib/functions/compilation/kernel-debs.sh || true
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl xz-utils qemu-system-arm qemu-utils \
+            cpio file
 
-      - name: Download RT patch
+      - name: Fetch pinned Armbian build framework
         run: |
-          set -ex
-          RT_URL="https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.6/patch-6.6.147-rt77.patch.xz"
-          echo "Downloading from: ${RT_URL}"
-          curl -fSL "${RT_URL}" -o /tmp/rt-patch.patch.xz || \
-            wget -v "${RT_URL}" -O /tmp/rt-patch.patch.xz
-          unxz -f /tmp/rt-patch.patch
-          echo "RT patch downloaded: $(wc -l < /tmp/rt-patch.patch) lines"
-
-      - name: Place RT patch in all possible archive directories
-        run: |
-          BUILD_DIR="$(pwd)/build"
-          for dir in "sunxi-6.6" "sunxi-current" "sunxi-edge" "sunxi-legacy"; do
-            mkdir -p "${BUILD_DIR}/userpatches/kernel/archive/${dir}"
-            cp /tmp/rt-patch.patch "${BUILD_DIR}/userpatches/kernel/archive/${dir}/000_rt_patch.patch"
-          done
-          echo "RT patch placed in archive directories"
-          find "${BUILD_DIR}/userpatches/kernel/archive" -name '*.patch' -ls
-
-      - name: Copy userpatches
-        run: |
+          git clone https://github.com/armbian/build.git build
+          git -C build checkout --detach "$ARMBIAN_COMMIT"
           cp userpatches/customize-image.sh build/userpatches/
-          cp userpatches/lib.config build/userpatches/
           chmod +x build/userpatches/customize-image.sh
 
-      - name: Build full RT image for Orange Pi Zero
+      - name: Add the exact official PREEMPT_RT patch and RT kernel config
+        run: |
+          set -euxo pipefail
+          curl --fail --location --retry 3 \
+            "https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.18/patch-${KERNEL_VERSION}-${RT_RELEASE}.patch.xz" \
+            --output /tmp/preempt-rt.patch.xz
+          xz --test /tmp/preempt-rt.patch.xz
+          mkdir -p build/userpatches/kernel/archive/sunxi-6.18
+          xz --decompress --stdout /tmp/preempt-rt.patch.xz \
+            > build/userpatches/kernel/archive/sunxi-6.18/0001-preempt-rt.patch
+          test -s build/userpatches/kernel/archive/sunxi-6.18/0001-preempt-rt.patch
+
+          cp build/config/kernel/linux-sunxi-current.config \
+            build/userpatches/linux-sunxi-current.config
+          config=build/userpatches/linux-sunxi-current.config
+          sed -i \
+            -e 's/^CONFIG_HZ_250=y$/# CONFIG_HZ_250 is not set\nCONFIG_HZ_1000=y\nCONFIG_HZ=1000/' \
+            -e 's/^CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND=y$/# CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND is not set\nCONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y/' \
+            "$config"
+          cat >> "$config" <<'EOF'
+# SamplerBox real-time profile.  The RT patch makes this choice available on ARMv7.
+CONFIG_EXPERT=y
+CONFIG_PREEMPT_RT=y
+CONFIG_HIGH_RES_TIMERS=y
+EOF
+          grep -qx 'CONFIG_PREEMPT_RT=y' "$config"
+
+      - name: Build Armbian image (fails if the RT patch does not apply)
         run: |
           cd build
           sudo ./compile.sh \
             BOARD=orangepizero \
             BRANCH=current \
-            KERNELBRANCH=tag:v6.6.147 \
+            KERNELBRANCH=tag:v${KERNEL_VERSION} \
             RELEASE=bookworm \
             BUILD_DESKTOP=no \
             BUILD_MINIMAL=yes \
             KERNEL_CONFIGURE=no \
-            EXPERT=yes \
             CLEAN_LEVEL=make,debs,oldcache
-        env:
-          PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-      - name: Verify RT kernel was built
+      - name: Verify compiled PREEMPT_RT configuration
         run: |
-          echo "=== Image artifacts ==="
-          ls -lh build/output/images/*.img* 2>/dev/null || echo "No images found"
-          echo "=== Kernel debs ==="
-          ls -lh build/output/debs/linux-*.deb 2>/dev/null || echo "No debs found"
-          echo "=== RT verification ==="
-          find build/output -name '*.deb' -exec dpkg-deb -f {} Version \; 2>/dev/null | head -10
+          set -euxo pipefail
+          image_deb=$(find build/output/debs -name 'linux-image*sunxi*.deb' -print -quit)
+          test -n "$image_deb"
+          rm -rf /tmp/kernel-package
+          dpkg-deb -x "$image_deb" /tmp/kernel-package
+          config=$(find /tmp/kernel-package/boot -name 'config-*' -print -quit)
+          kernel=$(find /tmp/kernel-package/boot -type f \( -name 'vmlinuz-*' -o -name 'zImage-*' \) -print -quit)
+          test -n "$config" && test -n "$kernel"
+          grep -qx 'CONFIG_PREEMPT_RT=y' "$config"
+          grep -qx 'CONFIG_HIGH_RES_TIMERS=y' "$config"
+          grep -qx 'CONFIG_HZ_1000=y' "$config"
+          grep -qx 'CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y' "$config"
+          echo "KERNEL=$kernel" >> "$GITHUB_ENV"
 
-      - name: Upload SD card image
+      - name: Boot the built RT kernel on an Allwinner H3-class QEMU board
+        run: |
+          set -euxo pipefail
+          dtb_deb=$(find build/output/debs -name 'linux-dtb*sunxi*.deb' -print -quit)
+          test -n "$dtb_deb"
+          rm -rf /tmp/dtb-package /tmp/initramfs
+          dpkg-deb -x "$dtb_deb" /tmp/dtb-package
+          dtb=$(find /tmp/dtb-package -name 'sun8i-h3-orangepi-pc.dtb' -print -quit)
+          test -n "$dtb"
+          mkdir -p /tmp/initramfs/{bin,proc,sys,dev}
+          apt-get download busybox-static:armhf
+          dpkg-deb -x busybox-static_*_armhf.deb /tmp/busybox-armhf
+          cp /tmp/busybox-armhf/bin/busybox /tmp/initramfs/bin/busybox
+          ln -s busybox /tmp/initramfs/bin/sh
+          cat > /tmp/initramfs/init <<'EOF'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+test "$(cat /sys/kernel/realtime)" = 1 || { echo RT_BOOT_FAILED; poweroff -f; }
+echo RT_BOOT_OK
+sleep 30
+echo RT_STABILITY_OK
+poweroff -f
+EOF
+          chmod +x /tmp/initramfs/init
+          (cd /tmp/initramfs && find . -print | cpio -o -H newc | gzip) > /tmp/initramfs.cpio.gz
+          timeout 75 qemu-system-arm -M orangepi-pc -cpu cortex-a7 -m 512 -smp 4 \
+            -kernel "$KERNEL" -dtb "$dtb" -initrd /tmp/initramfs.cpio.gz \
+            -append 'console=ttyS0,115200 rdinit=/init' -nographic -no-reboot \
+            > /tmp/qemu.log 2>&1 || true
+          cat /tmp/qemu.log
+          grep -qx 'RT_BOOT_OK' /tmp/qemu.log
+          grep -qx 'RT_STABILITY_OK' /tmp/qemu.log
+
+      - name: Upload ready-to-flash image
         uses: actions/upload-artifact@v4
         with:
-          name: SamplerBox-RT-Image-Orangepizero
-          path: build/output/images/*.img*
+          name: OrangePiZero-SamplerBox-RT-${{ env.KERNEL_VERSION }}-${{ env.RT_RELEASE }}
+          path: build/output/images/*.img.xz
           compression-level: 0
-          if-no-files-found: warn
+          if-no-files-found: error
 
-      - name: Upload kernel DEB packages
+      - name: Upload verification evidence
         uses: actions/upload-artifact@v4
         with:
-          name: SamplerBox-RT-Kernel-Debs
-          path: build/output/debs/linux-*.deb
+          name: OrangePiZero-SamplerBox-RT-verification
+          path: |
+            /tmp/qemu.log
+            build/output/debs/linux-*.deb
           compression-level: 0
-          if-no-files-found: warn
-
-      - name: Upload build log (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: SamplerBox-RT-Build-Log
-          path: build/output/logs/*.log*
-          compression-level: 0
-          if-no-files-found: ignore
+          if-no-files-found: error
