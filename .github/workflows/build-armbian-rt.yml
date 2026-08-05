@@ -59,11 +59,11 @@ jobs:
             -e 's/^CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND=y$/# CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND is not set\nCONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y/' \
             "$config"
           cat >> "$config" <<'EOF'
-# SamplerBox real-time profile.  The RT patch makes this choice available on ARMv7.
-CONFIG_EXPERT=y
-CONFIG_PREEMPT_RT=y
-CONFIG_HIGH_RES_TIMERS=y
-EOF
+          # SamplerBox real-time profile.  The RT patch makes this choice available on ARMv7.
+          CONFIG_EXPERT=y
+          CONFIG_PREEMPT_RT=y
+          CONFIG_HIGH_RES_TIMERS=y
+          EOF
           grep -qx 'CONFIG_PREEMPT_RT=y' "$config"
 
       - name: Build Armbian image (fails if the RT patch does not apply)
@@ -110,16 +110,16 @@ EOF
           cp /tmp/busybox-armhf/bin/busybox /tmp/initramfs/bin/busybox
           ln -s busybox /tmp/initramfs/bin/sh
           cat > /tmp/initramfs/init <<'EOF'
-#!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
-test "$(cat /sys/kernel/realtime)" = 1 || { echo RT_BOOT_FAILED; poweroff -f; }
-echo RT_BOOT_OK
-sleep 30
-echo RT_STABILITY_OK
-poweroff -f
-EOF
+          #!/bin/sh
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mount -t devtmpfs devtmpfs /dev
+          test "$(cat /sys/kernel/realtime)" = 1 || { echo RT_BOOT_FAILED; poweroff -f; }
+          echo RT_BOOT_OK
+          sleep 30
+          echo RT_STABILITY_OK
+          poweroff -f
+          EOF
           chmod +x /tmp/initramfs/init
           (cd /tmp/initramfs && find . -print | cpio -o -H newc | gzip) > /tmp/initramfs.cpio.gz
           timeout 75 qemu-system-arm -M orangepi-pc -cpu cortex-a7 -m 512 -smp 4 \
