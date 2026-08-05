@@ -25,11 +25,22 @@ jobs:
       - name: Clone Armbian Build Framework
         run: git clone --depth=1 https://github.com/armbian/build
 
+      - name: Patch build framework for RT version strings
+        run: |
+          cd build
+          # Handle RT suffix in kernel version (e.g. 6.6.147-rt77-current-sunxi)
+          sed -i 's/${kernel_version}-${BRANCH}/${kernel_version}-rt${RT_PATCH_VER}-${BRANCH}/g' \
+            lib/functions/compilation/kernel-debs.sh || true
+          # Also handle kernel_version_family
+          sed -i 's/declare kernel_version_family="${kernel_version}-${BRANCH}/declare kernel_version_family="${kernel_version}-rt${RT_PATCH_VER}-${BRANCH}/' \
+            lib/functions/compilation/kernel-debs.sh || true
+
       - name: Download RT patch
         run: |
-          wget -q "${RT_URL}" -O /tmp/rt-patch.patch.xz
+          echo "Downloading from: ${RT_URL}"
+          curl -fSL "${RT_URL}" -o /tmp/rt-patch.patch.xz
           unxz -f /tmp/rt-patch.patch
-          echo "RT patch downloaded: $(wc -l /tmp/rt-patch.patch) lines"
+          echo "RT patch downloaded: $(wc -l < /tmp/rt-patch.patch) lines"
 
       - name: Place RT patch in all possible archive directories
         run: |
@@ -39,6 +50,7 @@ jobs:
             cp /tmp/rt-patch.patch "${BUILD_DIR}/userpatches/kernel/archive/${dir}/000_rt_patch.patch"
           done
           echo "RT patch placed in archive directories"
+          find "${BUILD_DIR}/userpatches/kernel/archive" -name '*.patch' -ls
 
       - name: Copy userpatches
         run: |
