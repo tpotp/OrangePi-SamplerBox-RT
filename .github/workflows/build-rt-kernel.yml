@@ -1,0 +1,123 @@
+name: Build kernel PREEMPT_RT 7.0.1-rt2 Orange Pi Zero
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar dependencias de compilacion cruzada
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            crossbuild-essential-armhf \
+            libssl-dev libelf-dev \
+            bc bison flex kmod cpio \
+            u-boot-tools device-tree-compiler \
+            wget xz-utils \
+            qemu-system-arm
+
+      - name: Descargar fuente 7.0.1 y parche RT 7.0.1-rt2
+        run: |
+          mkdir -p "$HOME/k"
+          cd "$HOME/k"
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.0.1.tar.xz
+          wget -q https://cdn.kernel.org/pub/linux/kernel/projects/rt/7.0/patch-7.0.1-rt2.patch.xz
+          tar -xf linux-7.0.1.tar.xz
+          xz -d -c patch-7.0.1-rt2.patch.xz > rt.patch
+          ls -lh linux-7.0.1.tar.xz patch-7.0.1-rt2.patch.xz rt.patch
+
+      - name: VERIFICACION 1 - El parche RT debe aplicar limpio sobre 7.0.1
+        run: |
+          cd "$HOME/k/linux-7.0.1"
+          git init -q
+          git apply --check "$HOME/k/rt.patch" && echo "PATCH_OK: aplica limpio sobre linux-7.0.1" || { echo "PATCH_FALLA: no aplica, ABORTO durante la verificacion pre-compilacion"; exit 1; }
+          git apply "$HOME/k/rt.patch"
+          echo "ARCH_SUPPORTS_RT en arm:"
+          grep -n "ARCH_SUPPORTS_RT" arch/arm/Kconfig
+
+      - name: VERIFICACION 2 - Config con PREEMPT_RT=y (gate antes de compilar)
+        run: |
+          cd "$HOME/k/linux-7.0.1"
+          cp "$GITHUB_WORKSPACE/config-base.config" .config
+          scripts/config --enable CONFIG_EXPERT
+          scripts/config --disable CONFIG_PREEMPT_NONE
+          scripts/config --disable CONFIG_PREEMPT_VOLUNTARY
+          scripts/config --disable CONFIG_PREEMPT
+          scripts/config --enable CONFIG_PREEMPT_RT
+          make ARCH=arm olddefconfig
+          echo "== Lineas PREEMPT del .config =="
+          grep -E "CONFIG_(PREEMPT|ARCH_SUPPORTS_RT|EXPERT)" .config
+          grep -q '^CONFIG_PREEMPT_RT=y' .config && echo "RT_OK: CONFIG_PREEMPT_RT=y esta presente" || { echo "RT_FALLA: PREEMPT_RT no quedo activo, ABORTO antes de compilar"; exit 1; }
+          grep -q '^CONFIG_ARCH_SUPPORTS_RT=y' .config && echo "ARCH_RT_OK" || { echo "ARCH_RT_FALLA: arm no soporta RT"; exit 1; }
+
+      - name: Compilar zImage, dtbs y modulos
+        run: |
+          cd "$HOME/k/linux-7.0.1"
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)" zImage modules dtbs
+          echo "kernelrelease: $(make kernelrelease)"
+
+      - name: VERIFICACION 3 - Boot test del kernel RT en QEMU
+        run: |
+          cd "$HOME/k/linux-7.0.1"
+          VEXPRESS=$(find arch/arm/boot/dts -name 'vexpress-v2p-ca9.dtb' | head -1)
+          echo "dtb para test: $VEXPRESS"
+          DEB=$(wget -qO- http://deb.debian.org/debian/pool/main/b/busybox/ | grep -oE 'busybox-static_[0-9a-z.~+-]+_armhf\.deb' | head -1)
+          test -n "$DEB" || { echo "No se encontro busybox armhf"; exit 1; }
+          wget -q "http://deb.debian.org/debian/pool/main/b/busybox/$DEB"
+          dpkg-deb -x "$DEB" "$HOME/bb"
+          mkdir -p "$HOME/initroot/bin"
+          cp "$HOME/bb/bin/busybox" "$HOME/initroot/bin/busybox"
+          ln -sf busybox "$HOME/initroot/bin/sh"
+          printf '%s\n' '#!/bin/sh' 'export PATH=/bin' 'mount -t proc none /proc' 'mount -t sysfs none /sys' 'mount -t devtmpfs none /dev 2>/dev/null' 'echo "RT_BOOT_TEST_OK"' 'cat /proc/version' 'if [ -f /sys/kernel/realtime ]; then echo "RT_SYSFS_REALTIME=$(cat /sys/kernel/realtime)"; else echo "RT_SYSFS_MISSING"; fi' 'sync' 'echo o > /proc/sysrq-trigger 2>/dev/null' 'poweroff -f 2>/dev/null' 'sleep 2' > "$HOME/initroot/init"
+          chmod +x "$HOME/initroot/init"
+          cd "$HOME/initroot"
+          find . | cpio -o -H newc 2>/dev/null | gzip > "$HOME/initramfs.cpio.gz"
+          ls -lh "$HOME/initramfs.cpio.gz"
+          timeout 180 qemu-system-arm -M vexpress-a9 -cpu cortex-a9 -m 256 -kernel "$HOME/k/linux-7.0.1/arch/arm/boot/zImage" -dtb "$HOME/k/linux-7.0.1/$VEXPRESS" -initrd "$HOME/initramfs.cpio.gz" -append "console=ttyAMA0 rdinit=/init" -nographic -no-reboot > "$HOME/qemu.log" 2>&1
+          echo "QEMU_EXIT=$?"
+          echo "===== LOG QEMU ====="
+          cat "$HOME/qemu.log"
+          echo "===================="
+          if grep -q "RT_BOOT_TEST_OK" "$HOME/qemu.log" && grep -q "RT_SYSFS_REALTIME=1" "$HOME/qemu.log"; then
+            echo "QEMU_RT_OK: el kernel PREEMPT_RT arranca y reporta /sys/kernel/realtime=1"
+          else
+            echo "QEMU_RT_FALLA: el kernel RT no arranco correctamente en QEMU"
+            exit 1
+          fi
+
+      - name: Empaquetar .deb del kernel RT
+        run: |
+          cd "$HOME/k/linux-7.0.1"
+          KVER=$(make kernelrelease)
+          echo "KVER=$KVER"
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- INSTALL_MOD_PATH="$HOME/modroot" modules_install
+          cd "$HOME/modroot/lib/modules/$KVER/"
+          echo "Tamanio modulos antes de podar: $(du -sh . | cut -f1)"
+          rm -rf kernel/drivers/gpu kernel/drivers/media kernel/drivers/scsi kernel/drivers/nvme kernel/drivers/infiniband kernel/drivers/net/wireless kernel/drivers/bluetooth kernel/drivers/mtd kernel/drivers/staging kernel/drivers/nfc kernel/drivers/fpga kernel/drivers/remoteproc kernel/drivers/rpmsg kernel/drivers/net/ethernet/realtek kernel/drivers/net/ethernet/marvell
+          echo "Tamanio modulos despues de podar: $(du -sh . | cut -f1)"
+          mkdir -p "$HOME/debroot/boot" "$HOME/debroot/DEBIAN" "$HOME/debroot/lib/modules" "$HOME/debroot/usr/share/doc/linux-image-rt-sunxi"
+          cp "$HOME/k/linux-7.0.1/arch/arm/boot/zImage" "$HOME/debroot/boot/vmlinuz-$KVER"
+          cp "$HOME/k/linux-7.0.1/.config" "$HOME/debroot/boot/config-$KVER"
+          cp "$HOME/k/linux-7.0.1/System.map" "$HOME/debroot/boot/System.map-$KVER"
+          cp -a "$HOME/modroot/lib/modules/$KVER" "$HOME/debroot/lib/modules/"
+          printf 'Package: linux-image-rt-sunxi\nVersion: %s\nSection: kernel\nPriority: optional\nArchitecture: armhf\nMaintainer: SamplerOrange RT Builder <noreply@samplerorange.local>\nDescription: Kernel Linux %s con PREEMPT_RT para Orange Pi Zero (sun8i)\n' "$KVER" "$KVER" > "$HOME/debroot/DEBIAN/control"
+          printf '%s\n' '#!/bin/bash' 'set -e' 'KVER=$(ls /lib/modules | grep -i rt | head -1)' 'test -n "$KVER" || { echo "No se encontro el directorio de modulos RT"; exit 1; }' 'ln -sf vmlinuz-$KVER /boot/zImage' 'update-initramfs -c -k $KVER' 'mkimage -A arm -O linux -T ramdisk -C none -n "uInitrd $KVER" -d /boot/initrd.img-$KVER /boot/uInitrd-$KVER' 'ln -sf uInitrd-$KVER /boot/uInitrd' 'exit 0' > "$HOME/debroot/DEBIAN/postinst"
+          chmod 755 "$HOME/debroot/DEBIAN/postinst"
+          dpkg-deb --build --root-owner-group "$HOME/debroot" "$HOME/linux-image-rt-sunxi_${KVER}_armhf.deb"
+          cp "$HOME/linux-image-rt-sunxi_${KVER}_armhf.deb" "$GITHUB_WORKSPACE/"
+          ls -lh "$GITHUB_WORKSPACE"/*.deb
+
+      - name: Subir paquete DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: SamplerBox-OrangePiZero-RT-Kernel-Debs
+          path: ${{ github.workspace }}/*.deb
+          compression-level: 0

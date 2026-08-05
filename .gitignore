@@ -1,0 +1,26 @@
+# Imágenes de SD
+*.img
+*.img.xz
+*.iso
+
+# Directorios de compilación
+build/
+output/
+.git/
+.idea/
+.vscode/
+
+# Archivos temporales
+*.tmp
+*.log
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Entornos virtuales
+.venv/
+venv/

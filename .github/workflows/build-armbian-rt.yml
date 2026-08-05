@@ -1,0 +1,97 @@
+name: Build Armbian PREEMPT_RT para Orange Pi Zero
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  KERNEL_VERSION: "6.6.147"
+  RT_PATCH: "rt77"
+  RT_URL: "https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.6/patch-6.6.147-rt77.patch.xz"
+
+jobs:
+  build-rt-image:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 420
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: sudo apt-get update && sudo apt-get install -y git wget acl xz-utils curl
+
+      - name: Clone Armbian Build Framework
+        run: git clone --depth=1 https://github.com/armbian/build
+
+      - name: Download RT patch
+        run: |
+          wget -q "${RT_URL}" -O /tmp/rt-patch.patch.xz
+          unxz -f /tmp/rt-patch.patch
+          echo "RT patch downloaded: $(wc -l /tmp/rt-patch.patch) lines"
+
+      - name: Place RT patch in all possible archive directories
+        run: |
+          BUILD_DIR="$(pwd)/build"
+          for dir in "sunxi-6.6" "sunxi-current" "sunxi-edge" "sunxi-legacy"; do
+            mkdir -p "${BUILD_DIR}/userpatches/kernel/archive/${dir}"
+            cp /tmp/rt-patch.patch "${BUILD_DIR}/userpatches/kernel/archive/${dir}/000_rt_patch.patch"
+          done
+          echo "RT patch placed in archive directories"
+
+      - name: Copy userpatches
+        run: |
+          cp userpatches/customize-image.sh build/userpatches/
+          cp userpatches/lib.config build/userpatches/
+          chmod +x build/userpatches/customize-image.sh
+
+      - name: Build full RT image for Orange Pi Zero
+        run: |
+          cd build
+          sudo ./compile.sh \
+            BOARD=orangepizero \
+            BRANCH=current \
+            KERNELBRANCH=tag:v6.6.147 \
+            RELEASE=bookworm \
+            BUILD_DESKTOP=no \
+            BUILD_MINIMAL=yes \
+            KERNEL_CONFIGURE=no \
+            EXPERT=yes \
+            CLEAN_LEVEL=make,debs,oldcache
+        env:
+          PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+      - name: Verify RT kernel was built
+        run: |
+          echo "=== Image artifacts ==="
+          ls -lh build/output/images/*.img* 2>/dev/null || echo "No images found"
+          echo "=== Kernel debs ==="
+          ls -lh build/output/debs/linux-*.deb 2>/dev/null || echo "No debs found"
+          echo "=== RT verification ==="
+          find build/output -name '*.deb' -exec dpkg-deb -f {} Version \; 2>/dev/null | head -10
+
+      - name: Upload SD card image
+        uses: actions/upload-artifact@v4
+        with:
+          name: SamplerBox-RT-Image-Orangepizero
+          path: build/output/images/*.img*
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Upload kernel DEB packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: SamplerBox-RT-Kernel-Debs
+          path: build/output/debs/linux-*.deb
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SamplerBox-RT-Build-Log
+          path: build/output/logs/*.log*
+          compression-level: 0
+          if-no-files-found: ignore
