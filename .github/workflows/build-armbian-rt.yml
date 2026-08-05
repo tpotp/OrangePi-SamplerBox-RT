@@ -37,8 +37,11 @@ jobs:
 
       - name: Download RT patch
         run: |
+          set -ex
+          RT_URL="https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.6/patch-6.6.147-rt77.patch.xz"
           echo "Downloading from: ${RT_URL}"
-          curl -fSL "${RT_URL}" -o /tmp/rt-patch.patch.xz
+          curl -fSL "${RT_URL}" -o /tmp/rt-patch.patch.xz || \
+            wget -v "${RT_URL}" -O /tmp/rt-patch.patch.xz
           unxz -f /tmp/rt-patch.patch
           echo "RT patch downloaded: $(wc -l < /tmp/rt-patch.patch) lines"
 
